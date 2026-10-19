@@ -2,67 +2,56 @@ import os
 import json
 import boto3
 import psycopg2
+import numpy as np
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
+from ivf_cuda_wrapper import IVFIndexCUDAPython  # Importación del módulo CUDA
 
-# Cargar variables de entorno al importar el módulo
 load_dotenv()
 
-def convertir_texto_a_embedding(texto: str, region_name: str = "us-east-1") -> list:
-    """
-    Toma un texto de entrada, lo convierte en un vector de embedding 
-    utilizando AWS Bedrock (Amazon Titan Text Embeddings v1) y lo devuelve.
-    """
-    if not texto or not texto.strip():
-        print("El texto proporcionado está vacío.")
-        return []
+# Instancia global del índice IVF en CUDA
+ivf_cuda_index = None
 
-    # Inicializar el cliente de Bedrock Runtime
-    bedrock_runtime = boto3.client(
-        service_name="bedrock-runtime",
-        region_name=region_name
-    )
+def inicializar_o_obtener_indice_cuda(cursor) -> IVFIndexCUDAPython:
+    """
+    Extrae los vectores de RDS PostgreSQL y construye/entrena el índice IVF en la GPU usando CUDA.
+    """
+    global ivf_cuda_index
+    if ivf_cuda_index is not None:
+        return ivf_cuda_index
+
+    cursor.execute("SELECT id, embedding FROM public.duolingo_chunks;")
+    filas = cursor.fetchall()
+
+    if not filas:
+        return None
+
+    chunk_ids = [fila[0] for fila in filas]
+    vectores = np.array([json.loads(fila[1]) if isinstance(fila[1], str) else fila[1] for fila in filas], dtype=np.float32)
+
+    nlist = min(10, len(chunk_ids))
     
-    model_id = "amazon.titan-embed-text-v1"
-    
-    payload = {
-        "inputText": texto
-    }
-    
-    try:
-        response = bedrock_runtime.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(payload)
-        )
-        
-        # Leer la respuesta y extraer el vector
-        response_body = json.loads(response["body"].read())
-        embedding = response_body.get("embedding", [])
-        
-        return embedding
-        
-    except Exception as e:
-        print(f"❌ Error al generar el embedding del texto con Bedrock: {e}")
-        return []
+    # Inicializar y entrenar el índice en GPU mediante la DLL/SO
+    ivf_cuda_index = IVFIndexCUDAPython(nlist=nlist, nprobe=2, max_iters=15)
+    ivf_cuda_index.build(chunk_ids, vectores)
+
+    print("🚀 ¡Índice IVF acelerado con CUDA construido exitosamente!")
+    return ivf_cuda_index
 
 
 def buscar_chunks_cercanos(vector_consulta: list, k: int = 3) -> list:
     """
-    Toma un embedding de consulta y busca en la base de datos RDS PostgreSQL 
-    los k chunks más cercanos utilizando el índice vectorial (IVF).
+    Utiliza el índice IVF en CUDA para obtener los IDs más cercanos
+    y recupera el contenido textual de PostgreSQL.
     """
     if not vector_consulta:
         print("El vector de consulta está vacío.")
         return []
 
-    resultados_cercanos = []
     connection = None
     cursor = None
 
     try:
-        # Conexión forzando la base de datos 'vectorial-rag'
         connection = psycopg2.connect(
             host=os.getenv("DB_HOST"),
             database="vectorial-rag",
@@ -72,33 +61,48 @@ def buscar_chunks_cercanos(vector_consulta: list, k: int = 3) -> list:
         )
         cursor = connection.cursor()
 
-        # Consulta SQL utilizando el operador de distancia de coseno de pgvector (<=>)
-        vector_str = "[" + ",".join(map(str, vector_consulta)) + "]"
+        # 1. Obtener o construir el índice IVF acelerado por CUDA
+        index_cuda = inicializar_o_obtener_indice_cuda(cursor)
+        if index_cuda is None:
+            return []
 
+        # 2. Ejecutar búsqueda ANN en GPU
+        query_vec = np.array(vector_consulta, dtype=np.float32)
+        resultados_cuda = index_cuda.search(query_vec, k=k)
+
+        if not resultados_cuda:
+            return []
+
+        ids_candidatos = [item[0] for item in resultados_cuda]
+        distancias_map = {item[0]: item[1] for item in resultados_cuda}
+
+        # 3. Traer los chunks de la BD para las IDs filtradas por la GPU
         sql_query = """
-            SELECT section_title, source, chunk_text, (embedding <=> %s::vector) AS distancia
+            SELECT id, section_title, source, chunk_text
             FROM public.duolingo_chunks
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s;
+            WHERE id = ANY(%s);
         """
-
-        cursor.execute(sql_query, (vector_str, vector_str, k))
+        cursor.execute(sql_query, (ids_candidatos,))
         filas = cursor.fetchall()
 
+        resultados_cercanos = []
         for fila in filas:
-            section_title, source, chunk_text, distancia = fila
+            chunk_id, section_title, source, chunk_text = fila
             resultados_cercanos.append({
                 "section_title": section_title,
                 "source": source,
                 "chunk_text": chunk_text,
-                "distancia": float(distancia)
+                "distancia": distancias_map.get(chunk_id, 0.0)
             })
 
-        print(f"¡Búsqueda completada! Se recuperaron los {len(resultados_cercanos)} chunks más cercanos.")
+        # Preservar el ordenamiento determinado por CUDA
+        resultados_cercanos.sort(key=lambda x: x["distancia"])
+
+        print(f"¡Búsqueda con CUDA IVF completada! Recuperados {len(resultados_cercanos)} chunks.")
         return resultados_cercanos
 
     except Exception as e:
-        print(f"❌ Error al realizar la búsqueda vectorial en RDS: {e}")
+        print(f"❌ Error al realizar la búsqueda vectorial con CUDA: {e}")
         return []
 
     finally:
@@ -106,61 +110,3 @@ def buscar_chunks_cercanos(vector_consulta: list, k: int = 3) -> list:
             cursor.close()
         if connection:
             connection.close()
-
-
-
-
-def generar_respuesta_rag(pregunta: str, chunks_cercanos: list, model_id: str = "google.gemma-3-12b-it", region_name: str = "us-east-1") -> str:
-    """
-    Toma la pregunta del usuario y los chunks recuperados de RDS, construye un contexto 
-    y consulta a un modelo LLM en AWS Bedrock usando client.converse().
-    """
-    if not chunks_cercanos:
-        return "Lo siento, no encontré información relevante en los documentos para responder a tu pregunta."
-
-    contexto_textual = ""
-    for i, chunk in enumerate(chunks_cercanos, 1):
-        contexto_textual += f"\n--- Fragmento {i} [{chunk.get('section_title', 'Sin título')}] ---\n"
-        contexto_textual += chunk.get('chunk_text', '') + "\n"
-
-    prompt_completo = f"""
-SISTEMA: Eres 'Duolingo Thrive', un asistente virtual experto y amigable. 
-Tu objetivo es responder a la pregunta del usuario utilizando **única y exclusivamente** el contexto proporcionado a continuación. Si la respuesta no se encuentra en el contexto, di amablemente que no dispones de esa información. No inventes datos.
-
-[CONTEXTO DE DOCUMENTOS]
-{contexto_textual}
-
-Pregunta del usuario: {pregunta}
-
-Respuesta:
-"""
-
-    messages = [
-        {
-            "role": "user",
-            "content": [{"text": prompt_completo}]
-        }
-    ]
-
-    client = boto3.client("bedrock-runtime", region_name=region_name)
-
-    try:
-        response = client.converse(
-            modelId=model_id,
-            messages=messages,
-            inferenceConfig={
-                "maxTokens": 800,
-                "temperature": 0.3,
-                "topP": 0.9
-            }
-        )
-        
-        respuesta_ia = response['output']['message']['content'][0]['text']
-        return respuesta_ia
-        
-    except ClientError as e:
-        print(f"❌ Error de cliente en Bedrock LLM: {e}")
-        return "Ocurrió un error de validación o permisos al consultar el modelo en Bedrock."
-    except Exception as e:
-        print(f"❌ Error inesperado: {e}")
-        return "Ocurrió un error inesperado al intentar generar la respuesta con la Inteligencia Artificial."
